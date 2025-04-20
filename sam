@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 
 import argparse
+from datetime import datetime, timedelta
 from http import HTTPStatus
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
 import re
+import stat
 import subprocess
+from tempfile import gettempdir
 
 
 TEMPLATE = """
@@ -25,7 +29,7 @@ def render_body(metrics):
     return TEMPLATE.format(metrics).encode()
 
 
-def get_metrics(days_ago):
+def render_metrics(days_ago):
     args = (
         "sadf", "-T", "-g", "-O", "autoscale,oneday,showtoc,skipempty", "--",
         "-d", "--dev=sda",
@@ -39,6 +43,32 @@ def get_metrics(days_ago):
     )  # fmt: skip
     proc = subprocess.run(args, capture_output=True, check=True, text=True)
     return proc.stdout
+
+
+def get_metrics(days_ago):
+    date = datetime.now() - timedelta(days=days_ago)
+    file = Path(gettempdir(), "sam", "{}.svg".format(date.date().isoformat()))
+    fresh = False
+    if file.exists():
+        mtime = datetime.fromtimestamp(file.stat().st_mtime)
+        if days_ago > 0:
+            # was rendered the next day?
+            fresh = mtime.date() > date.date()
+        else:
+            # was rendered less then minute ago?
+            fresh = (date - mtime).total_seconds() < 60
+
+    if not fresh:
+        text = render_metrics(days_ago)
+        if not file.parent.exists():
+            file.parent.mkdir()
+            file.parent.chmod(stat.S_IRWXU)
+        file.write_text(text)
+        file.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    else:
+        text = file.read_text()
+
+    return text
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -60,7 +90,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
-        days_ago = match.group(1) or "0"
+        days_ago = int(match.group(1) or "0")
         try:
             body = render_body(get_metrics(days_ago))
         except Exception as exc:
