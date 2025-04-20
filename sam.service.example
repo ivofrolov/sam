@@ -1,0 +1,22 @@
+[Unit]
+After=network.target
+
+[Service]
+Type=exec
+Restart=always
+ExecStart=/opt/sam -H 0.0.0.0 -p 8000
+
+DynamicUser=yes
+ProtectSystem=yes
+ProtectHome=yes
+ProtectProc=invisible
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target
