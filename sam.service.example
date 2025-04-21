@@ -5,8 +5,7 @@ After=network.target
 Type=exec
 Restart=always
 ExecStart=/opt/sam -H 0.0.0.0 -p 8000
-
-DynamicUser=yes
+User=sam
 ProtectSystem=yes
 ProtectHome=yes
 ProtectProc=invisible
