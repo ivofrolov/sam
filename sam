@@ -4,6 +4,7 @@ import argparse
 from datetime import datetime, timedelta
 from http import HTTPStatus
 from http.server import HTTPServer, BaseHTTPRequestHandler
+import os
 from pathlib import Path
 import re
 import stat
@@ -18,7 +19,7 @@ TEMPLATE = """
         <meta charset="UTF-8"/>
         <title>system activity metrics</title>
     </head>
-    <body style="background-color: black; display: flex;">
+    <body style="background-color: white; display: flex;">
         <div style="margin-left: auto; margin-right: auto;">{}</div>
     </body>
 </html>
@@ -30,12 +31,24 @@ def render_body(metrics):
 
 
 def render_metrics(days_ago):
+    os.putenv(
+        "S_COLORS_PALETTE",
+        "0=dd22dd:1=008899:2=972500:3=808000:"
+        "4=531ab6:5=008900:6=3548cf:7=8f0075:"
+        "8=dd22dd:9=008899:A=972500:B=808000:"
+        "C=531ab6:D=008900:E=3548cf:F=b2ff1a:"
+        "G=e0e0e0:H=000000:I=595959:K=ffffff:"
+        "L=000000:T=2a5045:W=7f0000:X=595959",
+    )
     args = (
-        "sadf", "-T", "-g", "-O", "autoscale,oneday,showtoc,skipempty", "--",
-        "-d", "--dev=sda",
-        "-F", "MOUNT", "--fs=/,/media/backups",
+        "sadf", "-T", "-g",
+        "-O", "autoscale,customcol,oneday,showtoc,skipempty",
+        "--dev=sda", "--fs=/,/media/backups", "--iface=eth0",
+        "--",
+        "-d",
+        "-F", "MOUNT",
         "-m", "TEMP",
-        "-n", "DEV,EDEV", "--iface=eth0",
+        "-n", "DEV,EDEV",
         "-q", "LOAD",
         "-r",
         "-u",
@@ -55,7 +68,7 @@ def get_metrics(days_ago):
             # was rendered the next day?
             fresh = mtime.date() > date.date()
         else:
-            # was rendered less then minute ago?
+            # was rendered less than minute ago?
             fresh = (date - mtime).total_seconds() < 60
 
     if not fresh:
