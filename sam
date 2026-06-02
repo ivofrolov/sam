@@ -1,97 +1,239 @@
 #!/usr/bin/env python3
 
 import argparse
+import csv
+import io
+import logging
+import re
+import subprocess
 from datetime import datetime, timedelta
 from http import HTTPStatus
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import os
-from pathlib import Path
-import re
-import stat
-import subprocess
-from tempfile import gettempdir
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from string import Template
 
 
-TEMPLATE = """
+REPORT_TEMPLATE = Template("""
 <!doctype html>
 <html lang="en">
     <head>
         <meta charset="UTF-8"/>
         <title>system activity metrics</title>
+        <style>
+            body {
+                background-color: white;
+                font-family: monospace;
+                font-size: 11px;
+            }
+
+            main {
+                display: grid;
+                grid-template-columns: repeat(auto-fill, 700px);
+                justify-content: center;
+            }
+
+            h3 {
+                text-align: center;
+            }
+        </style>
     </head>
-    <body style="background-color: white; display: flex;">
-        <div style="margin-left: auto; margin-right: auto;">{}</div>
-    </body>
+    <body><main>$report</main></body>
 </html>
-"""
+""")
+
+SECTION_TEMPLATE = Template("""
+<section>
+    <h3>$title</h3>
+    <figure>$plot</figure>
+</section>
+""")
 
 
-def render_body(metrics):
-    return TEMPLATE.format(metrics).encode()
+SYSSTAT_METRICS = [
+    {
+        # sar -q LOAD
+        "title": "System Load",
+        "metrics": ["ldavg-5", "ldavg-15"],
+        "range": (0, 1),
+        "flag": "q",
+    },
+    {
+        # sar -u
+        "title": "Processor Statistics",
+        "metrics": ["%idle"],
+        "range": (0, 100),
+        "flag": "u",
+    },
+    {
+        # sar -r
+        "title": "Memory Utilization",
+        "metrics": ["%memused"],
+        "range": (0, 100),
+        "flag": "r",
+    },
+    {
+        # sar -m TEMP
+        "title": "Power Management Statistics",
+        "metrics": ["degC"],
+        "range": (0, 100),
+        "flag": "m",
+    },
+    {
+        # sar -F MOUNT [--fs=fs_list]
+        "title": "Mounted File Systems Statistics",
+        "metrics": ["%fsused"],
+        "range": (0, 100),
+        "flag": "F",
+        "dev_field": "MOUNTPOINT",
+    },
+    {
+        # sar -d [--dev=dev_list]
+        "title": "Block Devices Activity",
+        "metrics": ["rkB/s", "wkB/s"],
+        "range": (0, None),
+        "flag": "d",
+        "dev_field": "DEV",
+    },
+    {
+        # sar -n DEV [--iface=iface_list]
+        "title": "Network Statistics",
+        "metrics": ["rxkB/s", "txkB/s"],
+        "range": (0, None),
+        "flag": "n",
+        "dev_field": "IFACE",
+    },
+]
 
 
-def render_metrics(days_ago):
-    os.putenv(
-        "S_COLORS_PALETTE",
-        "0=dd22dd:1=008899:2=972500:3=808000:"
-        "4=531ab6:5=008900:6=3548cf:7=8f0075:"
-        "8=dd22dd:9=008899:A=972500:B=808000:"
-        "C=531ab6:D=008900:E=3548cf:F=b2ff1a:"
-        "G=e0e0e0:H=000000:I=595959:K=ffffff:"
-        "L=000000:T=2a5045:W=7f0000:X=595959",
-    )
-    args = (
-        "sadf", "-T", "-g",
-        "-O", "autoscale,customcol,oneday,showtoc,skipempty",
-        "--dev=sda", "--fs=/,/media/backups", "--iface=eth0",
+class SysstatCsvReader:
+    def __init__(self, csvfile):
+        self.reader = csv.reader(csvfile, delimiter=";")
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        hostname, interval, timestamp, *metrics = next(self.reader)
+        if len(metrics) == 1:
+            # skip dummy records
+            hostname, interval, timestamp, *metrics = next(self.reader)
+        if hostname.startswith("#"):
+            # it's a header, get next row with values
+            self.metricnames = metrics
+            hostname, interval, timestamp, *metrics = next(self.reader)
+        return dict(
+            zip(
+                ("hostname", "interval", "timestamp", *self.metricnames),
+                (hostname, interval, timestamp, *metrics),
+            )
+        )
+
+
+def extract_metrics(row, dev_field, metrics):
+    if dev_field is not None and dev_field not in row:
+        return
+    for metric in metrics:
+        if metric not in row:
+            return
+    for metric in metrics:
+        yield dict(
+            dev=row[dev_field] if dev_field is not None else None,
+            name=metric,
+            value=row[metric],
+        )
+
+
+def read_metrics(file):
+    for row in SysstatCsvReader(file):
+        for block in SYSSTAT_METRICS:
+            for metric in extract_metrics(
+                row,
+                block.get("dev_field"),
+                block["metrics"],
+            ):
+                metric.update(
+                    flag=block["flag"],
+                    hostname=row["hostname"],
+                    timestamp=row["timestamp"],
+                )
+                yield metric
+
+
+def fetch_metrics(host):
+    command = (
+        "ssh", host,
+        "sadf", "-d", "-U",
         "--",
-        "-d",
-        "-F", "MOUNT",
+        "-d", "--dev=vda",
+        "-F", "MOUNT", "--fs=/",
         "-m", "TEMP",
-        "-n", "DEV,EDEV",
+        "-n", "DEV", "--iface=eth0",
+        "-u",
         "-q", "LOAD",
         "-r",
-        "-u",
-        f"-{days_ago}",
     )  # fmt: skip
-    proc = subprocess.run(args, capture_output=True, check=True, text=True)
+    proc = subprocess.run(command, capture_output=True, check=True, text=True)
     return proc.stdout
 
 
-def get_metrics(days_ago):
-    date = datetime.now() - timedelta(days=days_ago)
-    file = Path(gettempdir(), "sam", "{}.svg".format(date.date().isoformat()))
-    fresh = False
-    if file.exists():
-        mtime = datetime.fromtimestamp(file.stat().st_mtime)
-        if days_ago > 0:
-            # was rendered the next day?
-            fresh = mtime.date() > date.date()
-        else:
-            # was rendered less than minute ago?
-            fresh = (date - mtime).total_seconds() < 60
+def import_metrics(host):
+    data = fetch_metrics(host)
+    return read_metrics(io.StringIO(data, newline=""))
 
-    if not fresh:
-        text = render_metrics(days_ago)
-        if not file.parent.exists():
-            file.parent.mkdir()
-            file.parent.chmod(stat.S_IRWXU)
-        file.write_text(text)
-        file.chmod(stat.S_IRUSR | stat.S_IWUSR)
-    else:
-        text = file.read_text()
 
-    return text
+def export_metrics(file, metrics):
+    writer = csv.writer(file, delimiter=";")
+    fieldnames = ("hostname", "timestamp", "flag", "dev", "name", "value")
+    writer.writerow(fieldnames)
+    for row in metrics:
+        writer.writerow(row[field] for field in fieldnames)
+
+
+def update_metrics_cache(filename, host):
+    with open(filename, mode="w", newline="") as outfile:
+        metrics = import_metrics(host)
+        export_metrics(outfile, metrics)
+
+
+def render_plot(filename, metric_names, metric_range, period):
+    yrange = (str(r) if r is not None else "*" for r in metric_range)
+    xranges = [
+        map(lambda r: str(int(r.timestamp())), range_)
+        for range_ in (
+            (period - timedelta(days=1, hours=8), period),  # day
+            (period - timedelta(weeks=1, days=1), period),  # week
+            (period - timedelta(weeks=4), period),  # month
+            (period - timedelta(days=365), period),  # year
+        )
+    ]
+    preface = (
+        f'FILENAME="{filename}"',
+        f'METRICS="{" ".join(metric_names)}"',
+        f'YRANGE="[{":".join(yrange)}]"',
+        f'XDRANGE="[{":".join(xranges[0])}]"',
+        f'XWRANGE="[{":".join(xranges[1])}]"',
+        f'XMRANGE="[{":".join(xranges[2])}]"',
+        f'XYRANGE="[{":".join(xranges[3])}]"',
+    )
+    command = ("gnuplot", "-e", ";".join(preface), "metrics.gp")
+    proc = subprocess.run(command, capture_output=True, check=True, text=True)
+    return re.sub(r"<\?xml.*?\?>", "", proc.stdout)  # strip xml declaration
+
+
+def render_report(host, cache_filename):
+    update_metrics_cache(cache_filename, host)
+    report = ""
+    for section in SYSSTAT_METRICS:
+        plot = render_plot(
+            filename=cache_filename,
+            metric_names=section["metrics"],
+            metric_range=section["range"],
+            period=datetime.now(),
+        )
+        report += SECTION_TEMPLATE.substitute(title=section["title"], plot=plot)
+    return REPORT_TEMPLATE.substitute(report=report)
 
 
 class Handler(BaseHTTPRequestHandler):
-    _debug = False
-
-    @classmethod
-    def with_debug(cls, value):
-        cls._debug = value
-        return cls
-
     def log_message(self, format, *args):
         if self._debug:
             super().log_message(format, *args)
@@ -105,7 +247,7 @@ class Handler(BaseHTTPRequestHandler):
 
         days_ago = int(match.group(1) or "0")
         try:
-            body = render_body(get_metrics(days_ago))
+            body = render_report().encode()
         except Exception as exc:
             self.log_error("%s", exc)
             self.send_response(HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -119,20 +261,23 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+def render(args):
+    report = render_report(args.host, args.cache)
+    print(report)
+
+
+def serve(args):
+    httpd = HTTPServer((args.host, args.port), Handler)
+    httpd.serve_forever()
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="system activity metrics server")
+    parser = argparse.ArgumentParser(description="sysstat metrics renderer")
     parser.add_argument(
-        "-H",
-        "--host",
-        default="localhost",
-        help="host to bind to (default: %(default)s)",
-    )
-    parser.add_argument(
-        "-p",
-        "--port",
-        type=int,
-        default=8000,
-        help="port to bind to (default: %(default)s)",
+        "-c",
+        "--cache",
+        default="cache.csv",
+        help="cache file path (default: %(default)s)",
     )
     parser.add_argument(
         "-v",
@@ -140,7 +285,34 @@ if __name__ == "__main__":
         action="store_true",
         help="display more information",
     )
+
+    subparsers = parser.add_subparsers(title="subcommands", required=True)
+
+    render_parser = subparsers.add_parser("render", help="render once")
+    render_parser.add_argument("host", help="hostname to fetch metrics from")
+    render_parser.set_defaults(func=render)
+
+    serve_parser = subparsers.add_parser("serve", help="run server")
+    serve_parser.add_argument(
+        "-H",
+        "--host",
+        default="localhost",
+        help="host to bind to (default: %(default)s)",
+    )
+    serve_parser.add_argument(
+        "-p",
+        "--port",
+        type=int,
+        default=8000,
+        help="port to bind to (default: %(default)s)",
+    )
+    serve_parser.set_defaults(func=serve)
+
     args = parser.parse_args()
 
-    httpd = HTTPServer((args.host, args.port), Handler.with_debug(args.verbose))
-    httpd.serve_forever()
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.ERROR,
+        format="%(message)s",
+    )
+
+    args.func(args)
