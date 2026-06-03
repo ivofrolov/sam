@@ -5,55 +5,13 @@ import csv
 import io
 import logging
 import re
+import shlex
 import subprocess
 import urllib.parse
 from datetime import datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from string import Template
-
-
-DOCUMENT_TEMPLATE = Template("""
-<!doctype html>
-<html lang="en">
-    <head>
-        <meta charset="UTF-8"/>
-        <title>system activity metrics</title>
-        <style>
-            body {
-                background-color: white;
-                font-family: monospace;
-                font-size: 11px;
-            }
-
-            main {
-                display: grid;
-                grid-template-columns: repeat(auto-fill, 700px);
-                justify-content: center;
-            }
-
-            .title {
-                text-align: center;
-            }
-        </style>
-    </head>
-    <body><main>$content</main></body>
-</html>
-""")
-
-REPORT_TEMPLATE = Template("""
-<article>
-    <h2 class="title">$hostname</h2>
-    <div class="report">$report</div>
-</article>
-""")
-
-SECTION_TEMPLATE = Template("""
-<section>
-    <h3 class="title">$title</h3>
-    <figure>$plot</figure>
-</section>
-""")
 
 
 SYSSTAT_METRICS = [
@@ -179,6 +137,7 @@ def fetch_metrics(destination):
         "-q", "LOAD",
         "-r",
     )  # fmt: skip
+    logging.debug("Executing command: %s", shlex.join(command))
     proc = subprocess.run(command, capture_output=True, check=True, text=True)
     return proc.stdout
 
@@ -188,53 +147,129 @@ def import_metrics(host):
     return read_metrics(io.StringIO(data, newline=""))
 
 
-def export_metrics(file, metrics):
-    writer = csv.writer(file, delimiter=";")
+def export_metrics(metrics):
+    output = io.StringIO(newline="")
+    writer = csv.writer(output, delimiter=";")
     fieldnames = ("hostname", "timestamp", "flag", "dev", "name", "value")
     writer.writerow(fieldnames)
     for row in metrics:
         writer.writerow(row[field] for field in fieldnames)
+    return output.getvalue()
 
 
-def update_metrics_cache(filename, host):
-    with open(filename, mode="w", newline="") as outfile:
-        metrics = import_metrics(host)
-        export_metrics(outfile, metrics)
+GNUPLOT_SCRIPT = """
+set terminal svg size 300,200 font "monospace,11"
+set tics font "monospace,9"
+set key font "monospace,9"
+
+set datafile separator ";"
+set datafile columnheaders
+
+set xdata time
+set timefmt "%s"
+set xtics timedate
+
+set style data fillsteps
+set style fill transparent solid 0.5 noborder
+set tics scale 0
+set grid
+
+set yrange @YRANGE
+
+set xtics format "%a"
+set xtics 1 days
+set xrange @XRANGE
+
+set key outside center top horizontal Left reverse
+
+plot for [metric in METRICS] \
+     $DATA \
+     using (column("timestamp")):(column("value")) \
+     if (stringcolumn("name") eq metric) \
+     title metric
+"""
 
 
-def render_plot(filename, metric_names, metric_range, period):
+def render_plot(data, metric_names, metric_range, period):
     yrange = (str(r) if r is not None else "*" for r in metric_range)
-    xranges = [
-        map(lambda r: str(int(r.timestamp())), range_)
-        for range_ in (
-            (period - timedelta(days=1, hours=8), period),  # day
-            (period - timedelta(weeks=1, days=1), period),  # week
-            (period - timedelta(weeks=4), period),  # month
-            (period - timedelta(days=365), period),  # year
-        )
-    ]
-    preface = (
-        f'FILENAME="{filename}"',
+    xrange = (
+        f"{r.timestamp():.0f}" for r in (period - timedelta(weeks=1, days=3), period)
+    )
+    input_ = (
+        "\n".join(("$DATA << EOD", data, "EOD")),
         f'METRICS="{" ".join(metric_names)}"',
         f'YRANGE="[{":".join(yrange)}]"',
-        f'XDRANGE="[{":".join(xranges[0])}]"',
-        f'XWRANGE="[{":".join(xranges[1])}]"',
-        f'XMRANGE="[{":".join(xranges[2])}]"',
-        f'XYRANGE="[{":".join(xranges[3])}]"',
+        f'XRANGE="[{":".join(xrange)}]"',
+        GNUPLOT_SCRIPT,
     )
-    command = ("gnuplot", "-e", ";".join(preface), "metrics.gp")
-    proc = subprocess.run(command, capture_output=True, check=True, text=True)
+    command = ("gnuplot",)
+    logging.debug("Executing command: %s", shlex.join(command))
+    proc = subprocess.run(
+        command,
+        input="\n".join(input_),
+        capture_output=True,
+        check=True,
+        text=True,
+    )
     return re.sub(r"<\?xml.*?\?>", "", proc.stdout)  # strip xml declaration
 
 
-def render_report(cache_filename, hosts):
+DOCUMENT_TEMPLATE = Template("""
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8"/>
+        <title>system activity metrics</title>
+        <style>
+            body {
+                background-color: white;
+                font-family: monospace;
+                font-size: 11px;
+            }
+
+            main {
+                display: grid;
+                grid-template-columns: repeat(auto-fill, 350px);
+                justify-content: center;
+            }
+
+            figure {
+                margin: 0px 25px;
+            }
+
+            .title {
+                text-align: center;
+            }
+        </style>
+    </head>
+    <body><main>$content</main></body>
+</html>
+""")
+
+REPORT_TEMPLATE = Template("""
+<article>
+    <h2 class="title">$hostname</h2>
+    <div class="report">$report</div>
+</article>
+""")
+
+SECTION_TEMPLATE = Template("""
+<section>
+    <h3 class="title">$title</h3>
+    <figure>$plot</figure>
+</section>
+""")
+
+
+def render_report(hosts):
     content = ""
     for host in hosts:
         report = ""
-        update_metrics_cache(cache_filename, host)
+        sysstat_data = import_metrics(host)
+        data = export_metrics(sysstat_data)
         for section in SYSSTAT_METRICS:
             plot = render_plot(
-                filename=cache_filename,
+                data,
                 metric_names=section["metrics"],
                 metric_range=section["range"],
                 period=datetime.now(),
@@ -285,7 +320,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def render(args):
-    report = render_report(args.cache, args.host)
+    report = render_report(args.host)
     print(report)
 
 
@@ -298,12 +333,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="sysstat metrics renderer")
 
     shared_parser = argparse.ArgumentParser(add_help=False)
-    shared_parser.add_argument(
-        "-c",
-        "--cache",
-        default="cache.csv",
-        help="cache file path (default: %(default)s)",
-    )
     shared_parser.add_argument(
         "-v",
         "--verbose",
