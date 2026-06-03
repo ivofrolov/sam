@@ -6,13 +6,14 @@ import io
 import logging
 import re
 import subprocess
+import urllib.parse
 from datetime import datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from string import Template
 
 
-REPORT_TEMPLATE = Template("""
+DOCUMENT_TEMPLATE = Template("""
 <!doctype html>
 <html lang="en">
     <head>
@@ -31,18 +32,25 @@ REPORT_TEMPLATE = Template("""
                 justify-content: center;
             }
 
-            h3 {
+            .title {
                 text-align: center;
             }
         </style>
     </head>
-    <body><main>$report</main></body>
+    <body><main>$content</main></body>
 </html>
+""")
+
+REPORT_TEMPLATE = Template("""
+<article>
+    <h2 class="title">$hostname</h2>
+    <div class="report">$report</div>
+</article>
 """)
 
 SECTION_TEMPLATE = Template("""
 <section>
-    <h3>$title</h3>
+    <h3 class="title">$title</h3>
     <figure>$plot</figure>
 </section>
 """)
@@ -158,9 +166,9 @@ def read_metrics(file):
                 yield metric
 
 
-def fetch_metrics(host):
+def fetch_metrics(destination):
     command = (
-        "ssh", host,
+        "ssh", destination,
         "sadf", "-d", "-U",
         "--",
         "-d", "--dev=vda",
@@ -219,18 +227,33 @@ def render_plot(filename, metric_names, metric_range, period):
     return re.sub(r"<\?xml.*?\?>", "", proc.stdout)  # strip xml declaration
 
 
-def render_report(host, cache_filename):
-    update_metrics_cache(cache_filename, host)
-    report = ""
-    for section in SYSSTAT_METRICS:
-        plot = render_plot(
-            filename=cache_filename,
-            metric_names=section["metrics"],
-            metric_range=section["range"],
-            period=datetime.now(),
+def render_report(cache_filename, hosts):
+    content = ""
+    for host in hosts:
+        report = ""
+        update_metrics_cache(cache_filename, host)
+        for section in SYSSTAT_METRICS:
+            plot = render_plot(
+                filename=cache_filename,
+                metric_names=section["metrics"],
+                metric_range=section["range"],
+                period=datetime.now(),
+            )
+            report += SECTION_TEMPLATE.substitute(title=section["title"], plot=plot)
+        content += REPORT_TEMPLATE.substitute(
+            hostname=extract_hostname(host),
+            report=report,
         )
-        report += SECTION_TEMPLATE.substitute(title=section["title"], plot=plot)
-    return REPORT_TEMPLATE.substitute(report=report)
+    return DOCUMENT_TEMPLATE.substitute(content=content)
+
+
+def extract_hostname(url):
+    hostname = urllib.parse.urlsplit(url).hostname
+    if not hostname:
+        hostname = urllib.parse.urlsplit(f"ssh://{url}").hostname
+    if not hostname:
+        hostname = url
+    return hostname
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -262,7 +285,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def render(args):
-    report = render_report(args.host, args.cache)
+    report = render_report(args.cache, args.host)
     print(report)
 
 
@@ -273,13 +296,15 @@ def serve(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="sysstat metrics renderer")
-    parser.add_argument(
+
+    shared_parser = argparse.ArgumentParser(add_help=False)
+    shared_parser.add_argument(
         "-c",
         "--cache",
         default="cache.csv",
         help="cache file path (default: %(default)s)",
     )
-    parser.add_argument(
+    shared_parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
@@ -288,11 +313,23 @@ if __name__ == "__main__":
 
     subparsers = parser.add_subparsers(title="subcommands", required=True)
 
-    render_parser = subparsers.add_parser("render", help="render once")
-    render_parser.add_argument("host", help="hostname to fetch metrics from")
+    render_parser = subparsers.add_parser(
+        "render",
+        help="render once",
+        parents=[shared_parser],
+    )
+    render_parser.add_argument(
+        "host",
+        help="hostname to fetch metrics from",
+        nargs="+",
+    )
     render_parser.set_defaults(func=render)
 
-    serve_parser = subparsers.add_parser("serve", help="run server")
+    serve_parser = subparsers.add_parser(
+        "serve",
+        help="run server",
+        parents=[shared_parser],
+    )
     serve_parser.add_argument(
         "-H",
         "--host",
