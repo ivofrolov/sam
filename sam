@@ -3,6 +3,7 @@
 import argparse
 import csv
 import io
+import itertools
 import logging
 import re
 import shlex
@@ -124,9 +125,8 @@ def read_metrics(file):
                 yield metric
 
 
-def fetch_metrics(destination):
-    command = (
-        "ssh", destination,
+def fetch_metrics(destination, days):
+    sadf_command = (
         "sadf", "-d", "-U",
         "--",
         "-d", "--dev=vda",
@@ -137,13 +137,24 @@ def fetch_metrics(destination):
         "-q", "LOAD",
         "-r",
     )  # fmt: skip
-    logging.debug("Executing command: %s", shlex.join(command))
-    proc = subprocess.run(command, capture_output=True, check=True, text=True)
-    return proc.stdout
+    bod = "---8---"
+    input_ = [
+        ("echo", bod),
+        *[itertools.chain(sadf_command, (f"-{d}",)) for d in range(days, 0, -1)],
+        sadf_command,
+    ]
+    proc = subprocess.run(
+        ("ssh", "-T", "-q", destination),
+        input="\n".join(map(shlex.join, input_)),
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+    return proc.stdout[proc.stdout.index(bod) + len(bod) + 1 :]  # skip MOTD
 
 
-def import_metrics(host):
-    data = fetch_metrics(host)
+def import_metrics(host, days):
+    data = fetch_metrics(host, days)
     return read_metrics(io.StringIO(data, newline=""))
 
 
@@ -167,17 +178,16 @@ set datafile columnheaders
 
 set xdata time
 set timefmt "%s"
-set xtics timedate
 
 set style data fillsteps
 set style fill transparent solid 0.5 noborder
 set tics scale 0
-set grid
+set grid xtics mxtics ytics
 
 set yrange @YRANGE
 
-set xtics format "%a"
-set xtics 1 days
+set xtics time format "%a" 1 days
+set mxtics 2
 set xrange @XRANGE
 
 set key outside center top horizontal Left reverse
@@ -190,11 +200,9 @@ plot for [metric in METRICS] \
 """
 
 
-def render_plot(data, metric_names, metric_range, period):
+def render_plot(data, period, metric_names, metric_range):
+    xrange = (f"{d.timestamp():.0f}" for d in period)
     yrange = (str(r) if r is not None else "*" for r in metric_range)
-    xrange = (
-        f"{r.timestamp():.0f}" for r in (period - timedelta(weeks=1, days=3), period)
-    )
     input_ = (
         "\n".join(("$DATA << EOD", data, "EOD")),
         f'METRICS="{" ".join(metric_names)}"',
@@ -202,10 +210,8 @@ def render_plot(data, metric_names, metric_range, period):
         f'XRANGE="[{":".join(xrange)}]"',
         GNUPLOT_SCRIPT,
     )
-    command = ("gnuplot",)
-    logging.debug("Executing command: %s", shlex.join(command))
     proc = subprocess.run(
-        command,
+        ("gnuplot",),
         input="\n".join(input_),
         capture_output=True,
         check=True,
@@ -262,17 +268,18 @@ SECTION_TEMPLATE = Template("""
 
 
 def render_report(hosts):
+    delta = timedelta(days=3)
     content = ""
     for host in hosts:
         report = ""
-        sysstat_data = import_metrics(host)
+        sysstat_data = import_metrics(host, delta.days)
         data = export_metrics(sysstat_data)
         for section in SYSSTAT_METRICS:
             plot = render_plot(
                 data,
+                period=(datetime.now() - delta, datetime.now()),
                 metric_names=section["metrics"],
                 metric_range=section["range"],
-                period=datetime.now(),
             )
             report += SECTION_TEMPLATE.substitute(title=section["title"], plot=plot)
         content += REPORT_TEMPLATE.substitute(
