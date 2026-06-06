@@ -85,7 +85,7 @@ def fetch_metrics(destination, days):
     sep = "---8---"
     input_ = [
         ("echo", sep),
-        *[itertools.chain(sadf_command, (f"-{d}",)) for d in range(days, 0, -1)],
+        *(itertools.chain(sadf_command, (f"-{d}",)) for d in range(days, 0, -1)),
         sadf_command,
     ]
     proc = subprocess.run(
@@ -98,7 +98,7 @@ def fetch_metrics(destination, days):
     return proc.stdout[proc.stdout.index(sep) + len(sep) + 1 :]  # skip MOTD
 
 
-GNUPLOT_SCRIPT = """
+GNUPLOT_SCRIPT_PREFACE = """
 set terminal svg size 300,200 font "monospace,11"
 set tics font "monospace,9"
 set key font "monospace,9"
@@ -112,13 +112,15 @@ set style fill transparent solid 0.5 noborder
 set tics scale 0
 set grid xtics mxtics ytics
 
-set yrange @YRANGE
-
 set xtics time format "%a" 1 days
 set mxtics 2
-set xrange @XRANGE
 
 set key outside center top horizontal Left reverse
+"""
+
+GNUPLOT_SCRIPT_LOOP = """
+set xrange @XRANGE
+set yrange @YRANGE
 
 do for [dev in DEVICES] {
     set label dev at graph 0,1 front left offset character 1,-1
@@ -129,19 +131,28 @@ do for [dev in DEVICES] {
          title metric
     unset label
 }
+
+set print "-"; print SEP; set print
 """
 
 
-def render_plot(data, period, device_names, metric_names, metric_range):
+def render_plots(data, period, sections, separator):
     xrange = (f"{d.timestamp():.0f}" for d in period)
-    yrange = (str(r) if r is not None else "*" for r in metric_range)
+    yrange = lambda range_: (str(r) if r is not None else "*" for r in range_)
     input_ = (
         "\n".join(("$DATA << EOD", data, "EOD")),
-        f'DEVICES="{" ".join(device_names)}"',
-        f'METRICS="{" ".join(metric_names)}"',
-        f'YRANGE="[{":".join(yrange)}]"',
-        f'XRANGE="[{":".join(xrange)}]"',
-        GNUPLOT_SCRIPT,
+        GNUPLOT_SCRIPT_PREFACE,
+        *itertools.chain.from_iterable(
+            (
+                f'DEVICES="{" ".join(section["devices"])}"',
+                f'METRICS="{" ".join(section["metrics"])}"',
+                f'XRANGE="[{":".join(xrange)}]"',
+                f'YRANGE="[{":".join(yrange(section["range"]))}]"',
+                f'SEP="{separator}"',
+                GNUPLOT_SCRIPT_LOOP,
+            )
+            for section in sections
+        ),
     )
     proc = subprocess.run(
         ("gnuplot",),
@@ -209,14 +220,14 @@ def render_report(hosts):
         data = fetch_metrics(host, delta.days)
         logging.debug("rendering plot for %s", host)
         collect_stats(data, SYSSTAT_METRICS)
-        for section in SYSSTAT_METRICS:
-            plot = render_plot(
-                data,
-                period=(datetime.now() - delta, datetime.now()),
-                device_names=section["devices"],
-                metric_names=section["metrics"],
-                metric_range=section["range"],
-            )
+        separator = "---8---"
+        output = render_plots(
+            data,
+            period=(datetime.now() - delta, datetime.now()),
+            sections=SYSSTAT_METRICS,
+            separator=separator,
+        )
+        for section, plot in zip(SYSSTAT_METRICS, output.split(separator)):
             report += SECTION_TEMPLATE.substitute(title=section["title"], plot=plot)
         content += REPORT_TEMPLATE.substitute(
             hostname=extract_hostname(host),
