@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 
 import argparse
-import csv
-import io
 import itertools
 import logging
 import re
@@ -21,113 +19,49 @@ SYSSTAT_METRICS = [
         "title": "System Load",
         "metrics": ["ldavg-5", "ldavg-15"],
         "range": (0, 1),
-        "flag": "q",
     },
     {
         # sar -u
         "title": "Processor Statistics",
         "metrics": ["%idle"],
         "range": (0, 100),
-        "flag": "u",
     },
     {
         # sar -r
         "title": "Memory Utilization",
         "metrics": ["%memused"],
         "range": (0, 100),
-        "flag": "r",
     },
     {
         # sar -m TEMP
         "title": "Power Management Statistics",
         "metrics": ["degC"],
         "range": (0, 100),
-        "flag": "m",
     },
     {
         # sar -F MOUNT [--fs=fs_list]
         "title": "Mounted File Systems Statistics",
         "metrics": ["%fsused"],
         "range": (0, 100),
-        "flag": "F",
-        "dev_field": "MOUNTPOINT",
     },
     {
         # sar -d [--dev=dev_list]
         "title": "Block Devices Activity",
         "metrics": ["rkB/s", "wkB/s"],
         "range": (0, None),
-        "flag": "d",
-        "dev_field": "DEV",
     },
     {
         # sar -n DEV [--iface=iface_list]
         "title": "Network Statistics",
         "metrics": ["rxkB/s", "txkB/s"],
         "range": (0, None),
-        "flag": "n",
-        "dev_field": "IFACE",
     },
 ]
 
 
-class SysstatCsvReader:
-    def __init__(self, csvfile):
-        self.reader = csv.reader(csvfile, delimiter=";")
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        hostname, interval, timestamp, *metrics = next(self.reader)
-        if len(metrics) == 1:
-            # skip dummy records
-            hostname, interval, timestamp, *metrics = next(self.reader)
-        if hostname.startswith("#"):
-            # it's a header, get next row with values
-            self.metricnames = metrics
-            hostname, interval, timestamp, *metrics = next(self.reader)
-        return dict(
-            zip(
-                ("hostname", "interval", "timestamp", *self.metricnames),
-                (hostname, interval, timestamp, *metrics),
-            )
-        )
-
-
-def extract_metrics(row, dev_field, metrics):
-    if dev_field is not None and dev_field not in row:
-        return
-    for metric in metrics:
-        if metric not in row:
-            return
-    for metric in metrics:
-        yield dict(
-            dev=row[dev_field] if dev_field is not None else None,
-            name=metric,
-            value=row[metric],
-        )
-
-
-def read_metrics(file):
-    for row in SysstatCsvReader(file):
-        for block in SYSSTAT_METRICS:
-            for metric in extract_metrics(
-                row,
-                block.get("dev_field"),
-                block["metrics"],
-            ):
-                metric.update(
-                    flag=block["flag"],
-                    hostname=row["hostname"],
-                    timestamp=row["timestamp"],
-                )
-                yield metric
-
-
 def fetch_metrics(destination, days):
     sadf_command = (
-        "sadf", "-d", "-U",
+        "sadf", "-p", "-U",
         "--",
         "-d", "--dev=vda",
         "-F", "MOUNT", "--fs=/",
@@ -137,9 +71,9 @@ def fetch_metrics(destination, days):
         "-q", "LOAD",
         "-r",
     )  # fmt: skip
-    bod = "---8---"
+    sep = "---8---"
     input_ = [
-        ("echo", bod),
+        ("echo", sep),
         *[itertools.chain(sadf_command, (f"-{d}",)) for d in range(days, 0, -1)],
         sadf_command,
     ]
@@ -150,22 +84,7 @@ def fetch_metrics(destination, days):
         check=True,
         text=True,
     )
-    return proc.stdout[proc.stdout.index(bod) + len(bod) + 1 :]  # skip MOTD
-
-
-def import_metrics(host, days):
-    data = fetch_metrics(host, days)
-    return read_metrics(io.StringIO(data, newline=""))
-
-
-def export_metrics(metrics):
-    output = io.StringIO(newline="")
-    writer = csv.writer(output, delimiter=";")
-    fieldnames = ("hostname", "timestamp", "flag", "dev", "name", "value")
-    writer.writerow(fieldnames)
-    for row in metrics:
-        writer.writerow(row[field] for field in fieldnames)
-    return output.getvalue()
+    return proc.stdout[proc.stdout.index(sep) + len(sep) + 1 :]  # skip MOTD
 
 
 GNUPLOT_SCRIPT = """
@@ -173,9 +92,7 @@ set terminal svg size 300,200 font "monospace,11"
 set tics font "monospace,9"
 set key font "monospace,9"
 
-set datafile separator ";"
-set datafile columnheaders
-
+set datafile separator tab
 set xdata time
 set timefmt "%s"
 
@@ -194,8 +111,8 @@ set key outside center top horizontal Left reverse
 
 plot for [metric in METRICS] \
      $DATA \
-     using (column("timestamp")):(column("value")) \
-     if (stringcolumn("name") eq metric) \
+     using 3:6 \
+     if (stringcolumn(5) eq metric) \
      title metric
 """
 
@@ -272,8 +189,7 @@ def render_report(hosts):
     content = ""
     for host in hosts:
         report = ""
-        sysstat_data = import_metrics(host, delta.days)
-        data = export_metrics(sysstat_data)
+        data = fetch_metrics(host, delta.days)
         for section in SYSSTAT_METRICS:
             plot = render_plot(
                 data,
