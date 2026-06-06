@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import argparse
+import collections
+import io
 import itertools
 import logging
 import re
@@ -59,14 +61,23 @@ SYSSTAT_METRICS = [
 ]
 
 
+def collect_stats(data, sections):
+    devices = collections.defaultdict(set)
+    for line in io.StringIO(data):
+        _, _, _, device, metric, _ = line.split("\t")
+        devices[metric].add(device)
+    for section in sections:
+        section["devices"] = list(sorted(devices[section["metrics"][0]]))
+
+
 def fetch_metrics(destination, days):
     sadf_command = (
         "sadf", "-p", "-U",
         "--",
-        "-d", "--dev=vda",
-        "-F", "MOUNT", "--fs=/",
+        "-d",
+        "-F", "MOUNT",
         "-m", "TEMP",
-        "-n", "DEV", "--iface=eth0",
+        "-n", "DEV",
         "-u",
         "-q", "LOAD",
         "-r",
@@ -109,19 +120,24 @@ set xrange @XRANGE
 
 set key outside center top horizontal Left reverse
 
-plot for [metric in METRICS] \
-     $DATA \
-     using 3:6 \
-     if (stringcolumn(5) eq metric) \
-     title metric
+do for [dev in DEVICES] {
+    set label dev at graph 0,1 front left offset character 1,-1
+    plot for [metric in METRICS] \
+         $DATA \
+         using 3:6 \
+         if (strcol(4) eq dev && strcol(5) eq metric) \
+         title metric
+    unset label
+}
 """
 
 
-def render_plot(data, period, metric_names, metric_range):
+def render_plot(data, period, device_names, metric_names, metric_range):
     xrange = (f"{d.timestamp():.0f}" for d in period)
     yrange = (str(r) if r is not None else "*" for r in metric_range)
     input_ = (
         "\n".join(("$DATA << EOD", data, "EOD")),
+        f'DEVICES="{" ".join(device_names)}"',
         f'METRICS="{" ".join(metric_names)}"',
         f'YRANGE="[{":".join(yrange)}]"',
         f'XRANGE="[{":".join(xrange)}]"',
@@ -189,11 +205,15 @@ def render_report(hosts):
     content = ""
     for host in hosts:
         report = ""
+        logging.debug("fetching metrics from %s", host)
         data = fetch_metrics(host, delta.days)
+        logging.debug("rendering plot for %s", host)
+        collect_stats(data, SYSSTAT_METRICS)
         for section in SYSSTAT_METRICS:
             plot = render_plot(
                 data,
                 period=(datetime.now() - delta, datetime.now()),
+                device_names=section["devices"],
                 metric_names=section["metrics"],
                 metric_range=section["range"],
             )
@@ -244,6 +264,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def render(args):
     report = render_report(args.host)
+    logging.debug("report rendered")
     print(report)
 
 
@@ -301,7 +322,7 @@ if __name__ == "__main__":
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.ERROR,
-        format="%(message)s",
+        format="[%(asctime)s] %(message)s",
     )
 
     args.func(args)
