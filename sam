@@ -2,6 +2,8 @@
 
 import argparse
 import collections
+import concurrent.futures
+import copy
 import io
 import itertools
 import logging
@@ -211,28 +213,36 @@ SECTION_TEMPLATE = Template("""
 """)
 
 
-def render_report(hosts):
-    delta = timedelta(days=3)
-    content = ""
-    for host in hosts:
-        report = ""
+def render_report(executor, hosts):
+    def _render(host, sections, delta):
         logging.debug("fetching metrics from %s", host)
         data = fetch_metrics(host, delta.days)
         logging.debug("rendering plot for %s", host)
-        collect_stats(data, SYSSTAT_METRICS)
+        collect_stats(data, sections)
         separator = "---8---"
         output = render_plots(
             data,
             period=(datetime.now() - delta, datetime.now()),
-            sections=SYSSTAT_METRICS,
+            sections=sections,
             separator=separator,
         )
-        for section, plot in zip(SYSSTAT_METRICS, output.split(separator)):
+        report = ""
+        for section, plot in zip(sections, output.split(separator)):
             report += SECTION_TEMPLATE.substitute(title=section["title"], plot=plot)
-        content += REPORT_TEMPLATE.substitute(
+        return REPORT_TEMPLATE.substitute(
             hostname=extract_hostname(host),
             report=report,
         )
+
+    delta = timedelta(days=3)
+    futures = [
+        executor.submit(_render, host, copy.deepcopy(SYSSTAT_METRICS), delta)
+        for host in hosts
+    ]
+    content = ""
+    for future in futures:
+        content += future.result()
+    logging.debug("report rendered")
     return DOCUMENT_TEMPLATE.substitute(content=content)
 
 
@@ -274,8 +284,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def render(args):
-    report = render_report(args.host)
-    logging.debug("report rendered")
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        report = render_report(executor, args.host)
     print(report)
 
 
