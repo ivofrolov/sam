@@ -4,6 +4,7 @@ import argparse
 import collections
 import concurrent.futures
 import copy
+import functools
 import io
 import itertools
 import logging
@@ -256,20 +257,22 @@ def extract_hostname(url):
 
 
 class Handler(BaseHTTPRequestHandler):
+    def __init__(self, executor, hosts, *args, **kwargs):
+        self.executor = executor
+        self.hosts = hosts
+        super().__init__(*args, **kwargs)
+
     def log_message(self, format, *args):
-        if self._debug:
-            super().log_message(format, *args)
+        logging.debug(f"%s {format}", self.address_string(), *args)
 
     def do_GET(self):
-        match = re.fullmatch(r"/(\d*)", self.path)
-        if not match:
+        if self.path != "/":
             self.send_response(HTTPStatus.NOT_FOUND)
             self.end_headers()
             return
 
-        days_ago = int(match.group(1) or "0")
         try:
-            body = render_report().encode()
+            body = render_report(self.executor, self.hosts).encode()
         except Exception as exc:
             self.log_error("%s", exc)
             self.send_response(HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -285,13 +288,18 @@ class Handler(BaseHTTPRequestHandler):
 
 def render(args):
     with concurrent.futures.ThreadPoolExecutor() as executor:
-        report = render_report(executor, args.host)
+        report = render_report(executor, args.dest)
     print(report)
 
 
 def serve(args):
-    httpd = HTTPServer((args.host, args.port), Handler)
-    httpd.serve_forever()
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        httpd = HTTPServer(
+            (args.host, args.port),
+            functools.partial(Handler, executor, args.dest),
+        )
+        logging.debug("listening on http://%s:%s", args.host, args.port)
+        httpd.serve_forever()
 
 
 if __name__ == "__main__":
@@ -304,6 +312,11 @@ if __name__ == "__main__":
         action="store_true",
         help="display more information",
     )
+    shared_parser.add_argument(
+        "dest",
+        help="hostname to fetch metrics from",
+        nargs="+",
+    )
 
     subparsers = parser.add_subparsers(title="subcommands", required=True)
 
@@ -311,11 +324,6 @@ if __name__ == "__main__":
         "render",
         help="render once",
         parents=[shared_parser],
-    )
-    render_parser.add_argument(
-        "host",
-        help="hostname to fetch metrics from",
-        nargs="+",
     )
     render_parser.set_defaults(func=render)
 
